@@ -1,0 +1,47 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-proxy-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        sleep 5
+        ollama pull nomic-embed-text
+        wait
+    healthcheck:
+      # Healthy only once the embedding model is actually pulled — otherwise
+      # nginx starts mid-pull and silently degrades to text-fallback matching
+      test: ["CMD", "ollama", "show", "nomic-embed-text"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 30
+
+  nginx:
+    image: nginx:1.29.1
+    container_name: ai-proxy-nginx
+    ports:
+      - "4242:4242"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./config:/etc/nginx:ro
+      - ./njs:/etc/njs:ro
+      - ./templates:/etc/nginx-ai-proxy/templates:ro
+      - nginx_keys:/etc/nginx-ai-proxy/keys
+    environment:
+      - NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx-ai-proxy/templates
+      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx-ai-proxy/keys
+      - OLLAMA_HOST=ollama
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+volumes:
+  ollama_data:
+  nginx_keys:

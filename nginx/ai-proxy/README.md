@@ -8,15 +8,17 @@ Simple demo showcasing how to use NGINX and NGINX JavaScript (NJS) to act as a s
 - AI model abstraction (OpenAI ↔ Anthropic) with request/response translation.
 - Per-model failover.
 - AI model token usage extraction into access logs.
+- Semantic caching of responses (embedding similarity with a text-similarity fallback) — see [`semantic_caching.md`](semantic_caching.md).
 
 This demo has the following limitations:
 
 - The JSON config is statically loaded (no dynamic reload logic here).
 - Only a subset of OpenAI → Anthropic fields are properly translated (enough for basic prompts).
-- No handling of AI streaming.
-- Authentication is done via header-based user identification (`X-User`); there is no actual auth.
+- No handling of AI streaming (streaming requests bypass the cache entirely).
+- Authentication is done via header-based API key (`x-api-key`) mapped to users.
 - Failover only triggers on non-200 HTTP status.
-- No rate limiting or caching.
+- No rate limiting.
+- The semantic cache is in-memory only (NGINX shared dictionary), scoped per **model** — not per user: cached responses are shared across all users with access to the same model. Do not send user-specific/confidential prompts through this demo (see the warning in [`semantic_caching.md`](semantic_caching.md)).
 
 ## Demo Walkthrough
 
@@ -37,6 +39,8 @@ Before you can run this demo, you will need:
     ```
 
 - A functional Docker installation.
+
+- (Optional, for semantic caching) Ollama with the `nomic-embed-text` model. Either run it on your host (`ollama pull nomic-embed-text`) or use the Docker Compose flow below, which runs and pulls it automatically. If Ollama is unreachable, the cache degrades gracefully to a text-similarity fallback.
 
 ### Launching the Container Demo Environment on Docker
 
@@ -63,6 +67,7 @@ Before you can run this demo, you will need:
       -v nginx-keys:/etc/nginx-ai-proxy/keys \
       -e NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx-ai-proxy/templates \
       -e NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx-ai-proxy/keys \
+      -e OLLAMA_HOST=host.docker.internal \
       -e OPENAI_API_KEY \
       -e ANTHROPIC_API_KEY \
       --name nginx-ai-proxy \
@@ -71,6 +76,16 @@ Before you can run this demo, you will need:
 
 The official NGINX image entrypoint runs `envsubst` on templates and creates an `openai-key.conf` and `anthropic-key.conf` NGINX config files under `/etc/nginx-ai-proxy/keys/` which are then `included` by the `aiproxy.conf` NGINX config file.
 
+### Alternative: Docker Compose (includes Ollama)
+
+Instead of the manual `docker run` steps above, you can use Docker Compose, which also starts an Ollama container and pulls the `nomic-embed-text` embedding model for the semantic cache:
+
+```bash
+docker compose up -d
+```
+
+Compose inherits `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from your shell environment. The first start downloads the embedding model (~274 MB), so NGINX may take a few minutes to come up (it waits until the model is available).
+
 ### Testing Basic Requests
 
 1. Try sending a request as `user-a` to the OpenAI model:
@@ -78,7 +93,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```bash
     curl -s -X POST http://localhost:4242/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -H 'X-User: user-a' \
+      -H 'x-api-key: sk-demo-key-user-a' \
       -d '{"model":"gpt-5","messages":[{"role":"user","content":"Hello"}]}'
     ```
 
@@ -127,8 +142,8 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```bash
     curl -s -X POST http://localhost:4242/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -H 'X-User: user-a' \
-      -d '{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello"}]}'
+      -H 'x-api-key: sk-demo-key-user-a' \
+      -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}]}'
     ```
 
     Expected response:
@@ -137,7 +152,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     {
       "id": "...",
       "object": "chat.completion",
-      "model": "claude-sonnet-4-20250514",
+      "model": "claude-sonnet-4-6",
       "choices": [
         {
           "index": 0,
@@ -161,8 +176,8 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```bash
     curl -s -X POST http://localhost:4242/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -H 'X-User: user-b' \
-      -d '{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"Hello"}]}'
+      -H 'x-api-key: sk-demo-key-user-b' \
+      -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello"}]}'
     ```
 
     Expected response:
@@ -170,7 +185,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```json
     {
       "error": {
-        "message": "The model 'claude-sonnet-4-20250514' was not found or is not accessible to the user"
+        "message": "The model 'claude-sonnet-4-6' was not found or is not accessible to the user"
       }
     }
     ```
@@ -193,6 +208,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
       -v nginx-keys:/etc/nginx-ai-proxy/keys \
       -e NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx-ai-proxy/templates \
       -e NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx-ai-proxy/keys \
+      -e OLLAMA_HOST=host.docker.internal \
       -e OPENAI_API_KEY=bad \
       -e ANTHROPIC_API_KEY \
       --name nginx-ai-proxy \
@@ -204,7 +220,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```bash
     curl -s -X POST http://localhost:4242/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -H 'X-User: user-a' \
+      -H 'x-api-key: sk-demo-key-user-a' \
       -d '{"model":"gpt-5","messages":[{"role":"user","content":"Hello"}]}'
     ```
 
@@ -214,7 +230,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     {
       "id": "...",
       "object": "chat.completion",
-      "model": "claude-sonnet-4-20250514",
+      "model": "claude-sonnet-4-6",
       "choices": [
         {
           "index": 0,
@@ -238,7 +254,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     ```bash
     curl -s -X POST http://localhost:4242/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -H 'X-User: user-b' \
+      -H 'x-api-key: sk-demo-key-user-b' \
       -d '{"model":"gpt-5","messages":[{"role":"user","content":"Hello"}]}'
     ```
 
@@ -255,7 +271,7 @@ The official NGINX image entrypoint runs `envsubst` on templates and creates an 
     }
     ```
 
-Output should show `"claude-sonnet-4-20250514"` model indicating fallback.
+Output should show `"claude-sonnet-4-6"` model indicating fallback.
 
 ## Cleanup
 
@@ -278,10 +294,15 @@ Output should show `"claude-sonnet-4-20250514"` model indicating fallback.
 | Path | Purpose |
 |------|---------|
 | [`config/nginx.conf`](config/nginx.conf) | Includes the default `nginx.conf` file with a few modifications. Major differences are loading the NJS module, tweaking the log format to include token vars and "including" the AI proxy NGINX config (`aiproxy.conf`) |
-| [`config/aiproxy.conf`](config/aiproxy.conf) | Includes upstream blocks for OpenAI/Anthropic with dynamic DNS resolution, sets up a server listening on port 4242, loads a JSON config into the `$ai_proxy_config` variable using NJS, exposes a `/v1/chat/completions` location entrypoint, and setups internal locations for the `/openai` and `/anthropic` models |
-| [`config/rbac.json`](config/rbac.json) | Includes the RBAC data in a JSON data format -- See section below for more information |
-| [`njs/aiproxy.js`](njs/aiproxy.js) | NJS script including JSON RBAC parsing and AI proxy routing logic (authorization, model lookup, model failover, provider-specific transforms, and token extraction) |
+| [`config/aiproxy.conf`](config/aiproxy.conf) | Includes upstream blocks for OpenAI/Anthropic with dynamic DNS resolution, sets up a server listening on port 4242, loads a JSON config into the `$ai_proxy_config` variable using NJS, exposes a `/v1/chat/completions` location entrypoint, sets up internal locations for the `/openai` and `/anthropic` models plus the `/ollama-embedding` and `/openai-embedding` embedding endpoints, and declares the `ai_cache` shared dictionary zone |
+| [`config/rbac.json`](config/rbac.json) | Includes the RBAC data in a JSON data format -- See section below for more information. Also holds the `semantic_cache` configuration block |
+| [`config/api_keys.conf`](config/api_keys.conf) | NGINX `map` translating `x-api-key` header values to RBAC user identities |
+| [`njs/aiproxy.js`](njs/aiproxy.js) | NJS script including JSON RBAC parsing and AI proxy routing logic (authorization, model lookup, model failover, provider-specific transforms, cache integration, and token extraction) |
+| [`njs/cache.js`](njs/cache.js) | Semantic cache: LRU+TTL store in the NGINX shared dictionary, cosine-similarity matching with a Jaccard text fallback |
+| [`njs/embeddings.js`](njs/embeddings.js) | Embedding API client (Ollama and OpenAI providers) used by the semantic cache |
 | [`templates/*.template`](templates/) | `envsubst` templates to inject API keys into included snippets |
+| [`docker-compose.yml`](docker-compose.yml) | Compose stack: NGINX proxy + Ollama (with automatic `nomic-embed-text` pull) |
+| [`test.sh`](test.sh) / [`tests/`](tests/) | Unit (njs), integration, and live e2e test suites |
 
 ### RBAC JSON Configuration Model
 
@@ -292,8 +313,8 @@ The [JSON RBAC model](config/rbac.json) looks like this:
   "users": {
     "user-a": {
       "models": [
-        {"name": "gpt-5", "failover": "claude-sonnet-4-20250514"},
-        {"name": "claude-sonnet-4-20250514"}
+        {"name": "gpt-5", "failover": "claude-sonnet-4-6"},
+        {"name": "claude-sonnet-4-6"}
       ]
     },
     "user-b": {
@@ -302,7 +323,7 @@ The [JSON RBAC model](config/rbac.json) looks like this:
   },
   "models": {
     "gpt-5": {"provider": "openai", "location": "/openai"},
-    "claude-sonnet-4-20250514": {"provider": "anthropic", "location": "/anthropic"}
+    "claude-sonnet-4-6": {"provider": "anthropic", "location": "/anthropic"}
   }
 }
 ```
@@ -311,12 +332,13 @@ Each user contains a list of allowed models (and an optional `failover` model). 
 
 ### NGINX Request Processing Flow
 
-1. A client POSTs an OpenAI chat completion request containing the appropriate JSON data to `/v1/chat/completions`. The header `X-User` details which user this client corresponds to.
+1. A client POSTs an OpenAI chat completion request containing the appropriate JSON data to `/v1/chat/completions`. The header `x-api-key` details which user this client corresponds to.
 2. The `aiproxy.js` NJS script validates the user and model access.
-3. NGINX proxies the request to the appropriate model via an internal location block (`/openai` or `/anthropic`).
-4. If the provider is Anthropic, the request is transformed by the NJS script to an Anthropic API compatible request. The response is then transformed back to an OpenAI compatible response.
-5. If the primary model returns a non-200 status code and a `failover` model is defined, a second attempt is made to the `failover` model.
-6. Once a successful request is completed, token counts are extracted from the response and logged within the NGINX access log.
+3. The semantic cache is consulted: the prompt embedding is compared against cached entries for the requested model. On a HIT, the cached response is returned immediately and no upstream call is made.
+4. On a cache MISS, NGINX proxies the request to the appropriate model via an internal location block (`/openai` or `/anthropic`).
+5. If the provider is Anthropic, the request is transformed by the NJS script to an Anthropic API compatible request. The response is then transformed back to an OpenAI compatible response.
+6. If the primary model returns a non-200 status code and a `failover` model is defined, a second attempt is made to the `failover` model.
+7. Once a successful request is completed, the response is stored in the semantic cache and token counts are extracted from the response and logged within the NGINX access log.
 
 ### Token Usage Logging in NGINX
 

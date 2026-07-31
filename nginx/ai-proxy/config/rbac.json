@@ -1,13 +1,35 @@
 {
+    "semantic_cache": {
+        "enabled": true,
+        "similarity_threshold": 0.95,
+        "text_similarity_threshold": 0.85,
+        "ttl_seconds": 3600,
+        "max_entries": 500,
+        "embedding": {
+            "provider": "ollama",
+            "providers": {
+                "ollama": {
+                    "model": "nomic-embed-text",
+                    "location": "/ollama-embedding",
+                    "dimensions": 768
+                },
+                "openai": {
+                    "model": "text-embedding-3-small",
+                    "location": "/openai-embedding",
+                    "dimensions": 1536
+                }
+            }
+        }
+    },
     "users": {
         "user-a": {
             "models": [
                 {
                     "name": "gpt-5",
-                    "failover": "claude-sonnet-4-20250514"
+                    "failover": "claude-sonnet-4-6"
                 },
                 {
-                    "name": "claude-sonnet-4-20250514"
+                    "name": "claude-sonnet-4-6"
                 }
             ]
         },
@@ -24,7 +46,7 @@
             "provider": "openai",
             "location": "/openai"
         },
-        "claude-sonnet-4-20250514": {
+        "claude-sonnet-4-6": {
             "provider": "anthropic",
             "location": "/anthropic"
         }

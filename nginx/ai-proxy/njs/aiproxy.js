@@ -1,11 +1,17 @@
 import fs from 'fs';
+import cache from 'cache.js';
 
 // Loads RBAC configuration from a JSON file and sets it to an NGINX variable
+let rbacConfigCache = null;
+
 function load_rbac() {
+    if (rbacConfigCache !== null) {
+        return rbacConfigCache;
+    }
     try {
         // Adjust the path as needed
-        let config = fs.readFileSync('/etc/nginx/rbac.json', 'utf8');
-        return config;
+        rbacConfigCache = fs.readFileSync('/etc/nginx/rbac.json', 'utf8');
+        return rbacConfigCache;
     } catch (e) {
         return JSON.stringify({
             error: "Failed to load RBAC: " + e.message
@@ -17,19 +23,15 @@ function load_rbac() {
 function transformAnthropicRequest(requestBody) {
     // Anthropic requires max_tokens, but our API may not always specify it -> fallback to defaults if not provided
     let maxTokens = requestBody.max_completion_tokens || requestBody.max_tokens || 512;
+    let reqTemp = requestBody.temperature !== undefined ? requestBody.temperature : 1.0;
 
     const anthropicRequest = {
         model: requestBody.model,
         max_tokens: maxTokens,
         stream: requestBody.stream || false,
-        temperature: requestBody.temperature || 1.0,
+        temperature: reqTemp / 2.0,
         top_p: requestBody.top_p
     };
-
-    // Scale Anthropic temperature based on its acceptable range (0-1) vs OpenAI (0-2)
-    if (anthropicRequest.temperature > 1.0) {
-        anthropicRequest.temperature = requestBody.temperature / 2.0;
-    }
 
     // Convert stop sequences to Anthropic's format
     if (requestBody.stop) {
@@ -165,12 +167,12 @@ async function route(r) {
             return;
         }
 
-        // Extract the user from NGINX variable (set by header)
+        // Extract the user from NGINX variable (set by map)
         const user = r.variables.aiproxy_user;
         if (!user) {
             r.return(401, JSON.stringify({
                 error: {
-                    message: "User not specified"
+                    message: "Invalid or missing API key"
                 }
             }));
             return;
@@ -234,6 +236,33 @@ async function route(r) {
             return;
         }
 
+        // Semantic cache lookup
+        // Streaming requests bypass the cache entirely: SSE bodies must never
+        // be stored or served to non-streaming clients (and vice versa).
+        const cacheConfig = config.semantic_cache;
+        const cacheable = cacheConfig && cacheConfig.enabled && requestBody.stream !== true;
+        let cacheResult = null;
+        if (cacheable) {
+            try {
+                cacheResult = await cache.lookup(requestBody, requestedModel, cacheConfig, r);
+                if (cacheResult.response !== null) {
+                    try {
+                        const parsed = JSON.parse(cacheResult.response);
+                        if (parsed.usage) {
+                            r.variables.ai_proxy_response_prompt_tokens = parsed.usage.prompt_tokens !== undefined ? parsed.usage.prompt_tokens : "";
+                            r.variables.ai_proxy_response_completion_tokens = parsed.usage.completion_tokens !== undefined ? parsed.usage.completion_tokens : "";
+                            r.variables.ai_proxy_response_total_tokens = parsed.usage.total_tokens !== undefined ? parsed.usage.total_tokens : "";
+                        }
+                    } catch (e) { /* ignore parse errors for token extraction */ }
+                    r.return(200, cacheResult.response);
+                    return;
+                }
+            } catch (e) {
+                r.log(`Semantic cache lookup error: ${e.message}`);
+                cacheResult = null;
+            }
+        }
+
         // Try primary model first
         let serviceReply = await tryModel(r, modelConfig, requestBody);
         let usedModelConfig = modelConfig;
@@ -268,12 +297,22 @@ async function route(r) {
             try {
                 const parsedResponse = JSON.parse(responseBody);
                 if (parsedResponse.usage) {
-                    r.variables.ai_proxy_response_prompt_tokens = parsedResponse.usage.prompt_tokens || "";
-                    r.variables.ai_proxy_response_completion_tokens = parsedResponse.usage.completion_tokens || "";
-                    r.variables.ai_proxy_response_total_tokens = parsedResponse.usage.total_tokens || "";
+                    r.variables.ai_proxy_response_prompt_tokens = parsedResponse.usage.prompt_tokens !== undefined ? parsedResponse.usage.prompt_tokens : "";
+                    r.variables.ai_proxy_response_completion_tokens = parsedResponse.usage.completion_tokens !== undefined ? parsedResponse.usage.completion_tokens : "";
+                    r.variables.ai_proxy_response_total_tokens = parsedResponse.usage.total_tokens !== undefined ? parsedResponse.usage.total_tokens : "";
                 }
             } catch (e) {
                 r.log(`Warning: Failed to parse response body for token extraction: ${e.toString()}`);
+            }
+
+            // Store in semantic cache, reusing the embedding already computed
+            // by lookup() so each request pays at most one embedding round-trip
+            if (cacheable) {
+                try {
+                    await cache.store(requestBody, requestedModel, responseBody, cacheConfig, r, cacheResult || undefined);
+                } catch (e) {
+                    r.log(`Semantic cache store error: ${e.message}`);
+                }
             }
         }
 
